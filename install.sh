@@ -2246,10 +2246,52 @@ PY2
               "${REALITY_PORT:-8443}" "${XHTTP_PORT:-2096}" "${WS_PATH:-}"
 }
 
+# publicKey обязан быть парой к фактическому privateKey инбаунда.
+# Если разъедется — клиент стучится «не тем» ключом, Reality молча уводит его
+# на прикрытие, и туннель не работает (WS при этом жив, потому что там Reality нет).
+sync_reality_pubkey() {
+  $DRY_RUN && return 0
+  local xb priv pub
+  xb="$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -1)"
+  [[ -x "$xb" ]] || return 0
+
+  priv="$(python3 - "$XUI_DB" <<'PY'
+import json, sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+for (st,) in con.execute("SELECT stream_settings FROM inbounds WHERE remark LIKE '%gore-%'"):
+    s = json.loads(st) if isinstance(st, str) else st
+    rs = s.get('realitySettings')
+    if rs and rs.get('privateKey'):
+        print(rs['privateKey']); break
+PY
+)"
+  [[ -n "$priv" ]] || return 0
+
+  pub="$("$xb" x25519 -i "$priv" 2>/dev/null | awk -F': *' '/[Pp]assword|[Pp]ublic/{print $2; exit}')"
+  [[ -n "$pub" ]] || { warn "не смог вычислить publicKey Reality"; return 0; }
+
+  python3 - "$XUI_DB" "$pub" <<'PY'
+import json, sqlite3, sys
+db, pub = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(db); cur = con.cursor()
+for iid, st in cur.execute("SELECT id, stream_settings FROM inbounds").fetchall():
+    s = json.loads(st) if isinstance(st, str) else st
+    rs = s.get('realitySettings')
+    if not rs:
+        continue
+    rs.setdefault('settings', {})['publicKey'] = pub
+    cur.execute("UPDATE inbounds SET stream_settings=? WHERE id=?", (json.dumps(s, ensure_ascii=False), iid))
+con.commit()
+PY
+  state_set REALITY_PUB "$pub"
+  ok "publicKey Reality синхронизирован: ${pub:0:12}…"
+}
+
 setup_panel() {
   install_xui
   certs_for_xui
   xui_configure
+  sync_reality_pubkey
   run systemctl restart x-ui
   $DRY_RUN || sleep 2
   if ! $DRY_RUN; then
