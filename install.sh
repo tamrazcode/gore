@@ -451,7 +451,12 @@ SystemMaxFileSize=50M
 EOF
   run systemctl restart systemd-journald
 
-  # лимиты файлов для nginx
+  # лимиты файлов для nginx: через systemd, иначе www-data упирается в 1024
+  # и получает 500 "Too many open files" под нагрузкой
+  write_file /etc/systemd/system/nginx.service.d/override.conf 644 <<'EOF'
+[Service]
+LimitNOFILE=65535
+EOF
   write_file /etc/security/limits.d/99-gore.conf 644 <<'EOF'
 * soft nofile 65535
 * hard nofile 65535
@@ -478,7 +483,9 @@ ensure_ports_free() {
 
 setup_firewall() {
   step "Файрвол"
-  local ports=(22 80 443 53 853 9339 7443 9443 17443)
+  # наружу — только то, что должно: 443 (SNI), 80 (ACME), DNS, DoT и инбаунды Xray.
+  # 7443/9443/17443 слушают только localhost за SNI-роутером и наружу не нужны.
+  local ports=(22 80 443 53 853 9339)
   run ufw --force reset >/dev/null 2>&1 || true
   run ufw default deny incoming
   run ufw default allow outgoing
@@ -496,8 +503,13 @@ setup_firewall() {
     # пробросы игр и прочего добавляются отдельно, здесь только 443/udp закрываем
     run ufw deny 443/udp
   fi
+  # инбаунды Xray: Reality и XHTTP должны быть доступны снаружи напрямую
+  if $WITH_VPN; then
+    run ufw allow "${REALITY_PORT:-8443}/tcp" comment 'gore Reality'
+    run ufw allow "${XHTTP_PORT:-2096}/tcp" comment 'gore XHTTP'
+  fi
   run ufw --force enable
-  ok "ufw включён: 22, 80, 443, 53, 853, 9339, 7443, 9443, 17443"
+  ok "ufw включён: 22, 80, 443, 53, 853, 9339"
 }
 
 create_layout() {
@@ -657,7 +669,11 @@ nginx_prepare() {
     if ! grep -q 'stream-enabled' /etc/nginx/nginx.conf; then
       printf '\nstream {\n    include /etc/nginx/stream-enabled/*.conf;\n}\n' >> /etc/nginx/nginx.conf
     fi
-    sed -i 's/worker_connections [0-9]*;/worker_connections 8192;/' /etc/nginx/nginx.conf
+    sed -i 's/worker_connections [0-9]*;/worker_connections 4096;/' /etc/nginx/nginx.conf
+    # файловых дескрипторов нужно больше, чем соединений: под нагрузкой без этого 500
+    if ! grep -q 'worker_rlimit_nofile' /etc/nginx/nginx.conf; then
+      sed -i '0,/^events {/s//worker_rlimit_nofile 65535;\n\nevents {/' /etc/nginx/nginx.conf
+    fi
     # версия nginx в заголовке не нужна (в 26.04 там server_tokens build)
     sed -i 's/^\( *\)server_tokens .*;/\1server_tokens off;/' /etc/nginx/nginx.conf
     # в stream-map ~900 доменов: дефолтного bucket 64 байта не хватает
@@ -2160,8 +2176,9 @@ PY2
     XUI_USER="$(sqlite3 "$XUI_DB" "SELECT username FROM users LIMIT 1;" 2>/dev/null || true)"
     XUI_USER="${XUI_USER:-admin}"
     if [[ -n "${PANEL_PASS:-}" ]]; then
-      /usr/local/x-ui/x-ui setting -password "$PANEL_PASS" >/dev/null 2>&1 \
-        || warn "пароль панели сменить не вышло — поменяй вручную: x-ui setting -password ..."
+      # в 3.11 команда требует ОБА поля: с одним -password молча падает и код 0
+      /usr/local/x-ui/x-ui setting -username "$XUI_USER" -password "$PANEL_PASS" >/dev/null 2>&1 \
+        || warn "пароль панели сменить не вышло — поменяй вручную: x-ui setting -username ... -password ..."
     fi
   fi
 
