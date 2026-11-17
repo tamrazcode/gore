@@ -644,18 +644,21 @@ nginx_prepare() {
             s|include /etc/nginx/sites-enabled|include ${P}/etc/nginx/sites-enabled|g" "$conf"
     grep -q 'stream-enabled' "$conf" || \
       printf '\nstream {\n    include %s/etc/nginx/stream-enabled/*.conf;\n}\n' "$P" >> "$conf"
+    sed -i 's/^\( *\)server_tokens .*;/\1server_tokens off;/' "$conf"
     info "dry-run: nginx.conf собран в $conf"
   else
     if ! grep -q 'stream-enabled' /etc/nginx/nginx.conf; then
       printf '\nstream {\n    include /etc/nginx/stream-enabled/*.conf;\n}\n' >> /etc/nginx/nginx.conf
     fi
     sed -i 's/worker_connections [0-9]*;/worker_connections 8192;/' /etc/nginx/nginx.conf
+    # версия nginx в заголовке не нужна (в 26.04 там server_tokens build)
+    sed -i 's/^\( *\)server_tokens .*;/\1server_tokens off;/' /etc/nginx/nginx.conf
   fi
 
   # общие настройки http-уровня
+  # server_tokens не задаём: в Ubuntu 26.04 он уже есть в nginx.conf, дубль ломает конфиг
   write_file /etc/nginx/conf.d/00-gore-base.conf 644 <<'EOF'
-# gore: базовые настройки
-server_tokens off;
+# gore: базовые настройки (server_tokens живёт в nginx.conf)
 client_max_body_size 64m;
 client_body_timeout 1d;
 proxy_read_timeout 1d;
