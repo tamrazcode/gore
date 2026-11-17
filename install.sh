@@ -505,11 +505,9 @@ setup_firewall() {
     # пробросы игр и прочего добавляются отдельно, здесь только 443/udp закрываем
     run ufw deny 443/udp
   fi
-  # инбаунды Xray: Reality и XHTTP должны быть доступны снаружи напрямую
-  if $WITH_VPN; then
-    run ufw allow "${REALITY_PORT:-8443}/tcp" comment 'gore Reality'
-    run ufw allow "${XHTTP_PORT:-2096}/tcp" comment 'gore XHTTP'
-  fi
+  # Инбаунды Xray наружу НЕ открываем: и Reality (:8443), и WS (:10000) слушают
+  # только localhost, а XHTTP вообще на unix-сокете. Снаружи entry point один —
+  # nginx на :443. Открытые 8443/2096 собирали мусор и дразнили ТСПУ.
   run ufw --force enable
   ok "ufw включён: 22, 80, 443, 53, 853, 9339"
 }
@@ -721,7 +719,9 @@ gen_stream_conf_file() {
     $WITH_DNS && [[ -n "$DNS_DOMAIN" ]] && printf '    %-52s smartdns_monitor;\n' "$DNS_DOMAIN"
     printf '    %-52s www;\n' "$DOMAIN"
     if $WITH_VPN && [[ -n "$REALITY_DOMAIN" ]]; then
-      printf '    %-52s reality_site;\n' "$REALITY_DOMAIN"
+      # Reality живёт за этим же stream на 8443: SNI домена-прикрытия ведём в xray,
+      # иначе клиент попадает в фейк-сайт и рукопожатие разваливается
+      printf '    %-52s xray;\n' "$REALITY_DOMAIN"
     fi
     if $WITH_DNS; then
       local policy; policy="$(path /etc/smartdns/policy.json)"
@@ -755,6 +755,9 @@ PY
     printf '%s\n' "    proxy_pass \$sni_target;"
     printf '%s\n' "    ssl_preread on;"
     printf '%s\n' "    proxy_protocol on;"
+    # 6 с вместо дефолтных 30: клиент, открывший TCP и молчащий, получает обрыв
+    # быстро, а не висит полминуты на каждую попытку
+    printf '%s\n' "    preread_timeout 6s;"
     printf '%s\n' "    proxy_connect_timeout 10s;"
     printf '%s\n' "}"
   } > "$out"
@@ -834,8 +837,10 @@ gen_vhost_reality() {
 server {
     server_tokens off;
     server_name ${REALITY_DOMAIN};
-    listen 9443 ssl proxy_protocol;
-    listen [::]:9443 ssl proxy_protocol;
+    # БЕЗ proxy_protocol: сюда ходит сам Xray (REALITY target), а он PROXY-заголовок
+    # не шлёт — с ним каждое падение REALITY-авторизации рвалось на broken header
+    listen 9443 ssl;
+    listen [::]:9443 ssl;
     http2 on;
     root $(path /var/www/html);
     index index.html;
@@ -844,10 +849,6 @@ server {
     ssl_certificate_key ${cert}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH:!EXP:!PSK:!DSS;
-
-    real_ip_header proxy_protocol;
-    set_real_ip_from 127.0.0.1;
-    set_real_ip_from ::1;
 
     if (\$host !~* ^(.+\.)?${REALITY_DOMAIN//./\\.}\$) { return 444; }
     error_page 400 401 402 403 500 501 502 503 504 =404 /404.html;
@@ -1762,14 +1763,26 @@ setup_smartdns() {
 # --- 08-vpn
 # ============================================================================
 # ------------------------------------------------------------------- VPN -----
-# Транспорт по состоянию на 2026: Reality закрывает TLS-отпечаток и активное
-# зондирование, XHTTP — поведение соединения после рукопожатия. Оба ставим,
-# панель не ставим: это самая заметная снаружи часть.
+# Транспорт по состоянию на ноябрь 2026, схема проверена на живом сервере:
+#
+#   :443 (nginx stream, SNI-роутер, proxy_protocol on)
+#     ├─ SNI домена-прикрытия → xray :8443  (VLESS+REALITY, TCP+Vision)
+#     ├─ SNI панели            → nginx :7443 (фейк-сайт, панель, подписка)
+#     │     ├─ /<WS_PATH>     → xray :10000  (WS)
+#     │     └─ /<XHTTP_PATH>  → grpc_pass на unix:/dev/shm/xray-uds.sock (XHTTP)
+#     └─ SNI из policy.json    → smartdns relay :15443
+#
+# Главное, на чём спотыкались:
+#   1. Reality ЗА nginx требует "tcpSettings": {"acceptProxyProtocol": true},
+#      иначе nginx уже отправил PROXY-заголовок, а Xray читает его как TLS → обрыв.
+#   2. XHTTP ходит только по HTTP/2, а nginx умеет отдавать h2 на бэкенд лишь
+#      через grpc_pass — поэтому Xray слушает unix-сокет, а не TCP-порт.
+#   3. realitySettings.dest должен смотреть на свой же vhost :9443 (фейк-сайт),
+#      а serverNames — на домен-прикрытие; так сертификат всегда валиден.
 
 REALITY_PORT_DEFAULT=8443
-XHTTP_PORT_DEFAULT=2096
 WS_PORT_LOCAL=10000
-REALITY_DEST_DEFAULT="www.microsoft.com:443"
+XRAY_UDS="/dev/shm/xray-uds.sock,0666"
 
 install_xray() {
   step "Xray-core"
@@ -1789,26 +1802,30 @@ install_xray() {
 }
 
 gen_xray_config() {
-  step "Конфиг Xray (Reality + XHTTP)"
+  step "Конфиг Xray (Reality за nginx + XHTTP через unix-сокет)"
 
   local uuid_count="${USERS:-3}"
   local reality_port="${REALITY_PORT:-$REALITY_PORT_DEFAULT}"
-  local xhttp_port="${XHTTP_PORT:-$XHTTP_PORT_DEFAULT}"
-  local dest="${REALITY_DEST:-$REALITY_DEST_DEFAULT}"
+  local reality_domain="${REALITY_DOMAIN:-}"
+  local xhttp_path="${XHTTP_PATH:-x$(rand_str 12)}"
+
+  [[ -n "$reality_domain" ]] || die "не задан --reality-domain (нужен для Reality)"
+  [[ -n "${DOMAIN:-}" ]] || die "не задан --domain"
 
   # ключи Reality
   local priv pub shortid
   if $DRY_RUN; then
     priv="private-key-placeholder"
     pub="public-key-placeholder"
+    shortid="deadbeefdeadbeef"
   else
     local keys
     keys=$(/usr/local/bin/xray x25519 2>/dev/null | tr -d '\r')
     priv=$(awk -F': *' '/[Pp]rivate/{print $2; exit}' <<<"$keys")
     pub=$(awk -F': *' '/[Pp]ublic/{print $2; exit}' <<<"$keys")
     [[ -n "$priv" && -n "$pub" ]] || die "не смог сгенерировать ключи Reality"
+    shortid=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
   fi
-  shortid=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
 
   # UUID клиентов
   local uuids=()
@@ -1825,24 +1842,15 @@ gen_xray_config() {
   ensure_dir /usr/local/etc/xray
   local rules_json; rules_json="$(xray_routing_rules)"
 
-  python3 - "$out" "$uuids" "$priv" "$dest" "$reality_port" "$xhttp_port" "$WS_PORT_LOCAL" "$ws_path" "$shortid" "$rules_json" <<'PY'
+  python3 - "$out" "$uuids" "$priv" "$reality_domain" "$reality_port" \
+           "$ws_path" "$shortid" "$rules_json" "$xhttp_path" "$DOMAIN" "$XRAY_UDS" <<'PY'
 import json, sys
-out, uuids, privkey, dest, rport, xport, wsport, wspath, shortid, rules = sys.argv[1:11]
+(out, uuids, privkey, reality_domain, rport,
+ wspath, shortid, rules, xpath, domain, uds) = sys.argv[1:12]
 uuids = uuids.split()
-host = dest.split(':')[0]
 
 clients_vision = [{"id": u, "flow": "xtls-rprx-vision", "email": f"user{i+1}"} for i, u in enumerate(uuids)]
-clients_plain  = [{"id": u, "email": f"user{i+1}-xhttp"} for i, u in enumerate(uuids)]
-
-def reality(flow=False):
-    return {
-        "show": False,
-        "dest": dest,
-        "xver": 0,
-        "serverNames": [host],
-        "privateKey": privkey,
-        "shortIds": [shortid],
-    }
+clients_plain  = [{"id": u, "email": f"user{i+1}-plain"} for i, u in enumerate(uuids)]
 
 cfg = {
     "log": {"loglevel": "warning"},
@@ -1852,47 +1860,61 @@ cfg = {
     },
     "inbounds": [
         {
+            # REALITY за nginx stream: обязателен acceptProxyProtocol
             "tag": "vless-reality",
-            "listen": "0.0.0.0",
+            "listen": "127.0.0.1",
             "port": int(rport),
             "protocol": "vless",
             "settings": {"clients": clients_vision, "decryption": "none"},
             "streamSettings": {
                 "network": "tcp",
                 "security": "reality",
-                "realitySettings": reality(True),
+                "realitySettings": {
+                    "show": False,
+                    "xver": 0,
+                    # прикрытие — свой же фейк-сайт на :9443
+                    "dest": "127.0.0.1:9443",
+                    "serverNames": [reality_domain],
+                    "privateKey": privkey,
+                    "shortIds": [shortid],
+                    "maxTimeDiff": 0,
+                },
+                "tcpSettings": {"acceptProxyProtocol": True, "header": {"type": "none"}},
             },
             "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
         },
         {
-            "tag": "vless-xhttp-reality",
-            "listen": "0.0.0.0",
-            "port": int(xport),
+            # XHTTP только по HTTP/2 → unix-сокет, nginx отдаёт туда grpc_pass
+            "tag": "vless-xhttp",
+            "listen": uds.split(',')[0],
+            "port": 0,
             "protocol": "vless",
             "settings": {"clients": clients_plain, "decryption": "none"},
             "streamSettings": {
                 "network": "xhttp",
-                "security": "reality",
-                "realitySettings": reality(False),
+                "security": "none",
                 "xhttpSettings": {
-                    "path": "/api/v2/sync",
-                    "mode": "auto",
-                    "extra": {"xPaddingBytes": "100-1000"},
+                    "path": "/" + xpath,
+                    "host": domain,
+                    "headers": {},
+                    "mode": "packet-up",
+                    "xPaddingBytes": "100-1000",
                 },
+                "sockopt": {"tcpMaxSeg": 1440, "tcpNoDelay": True, "tcpcongestion": "bbr"},
             },
             "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
         },
         {
             "tag": "vless-ws-cdn",
             "listen": "127.0.0.1",
-            "port": int(wsport),
+            "port": 10000,
             "protocol": "vless",
-            "settings": {"clients": clients_plain, "decryption": "none"},
             "streamSettings": {
                 "network": "ws",
                 "security": "none",
-                "wsSettings": {"path": wspath, "host": ""},
+                "wsSettings": {"path": wspath, "host": domain},
             },
+            "settings": {"clients": clients_plain, "decryption": "none"},
         },
     ],
     "outbounds": [
@@ -1910,53 +1932,58 @@ PY
   chmod 600 "$out"
 
   REALITY_PORT="$reality_port"
-  XHTTP_PORT="$xhttp_port"
+  XHTTP_PATH="$xhttp_path"
   WS_PATH="$ws_path"
-  REALITY_DEST="$dest"
   state_set REALITY_PORT "$reality_port"
-  state_set XHTTP_PORT "$xhttp_port"
+  state_set XHTTP_PATH "$xhttp_path"
   state_set WS_PATH "$ws_path"
   state_set REALITY_PUB "$pub"
   state_set REALITY_SHORTID "$shortid"
-  state_set REALITY_DEST "$dest"
 
-  # ссылки для клиентов
-  write_links "$uuids" "$pub" "$shortid" "$dest" "$reality_port" "$xhttp_port" "$ws_path"
-  ok "Reality :$reality_port (Vision) · XHTTP :$xhttp_port · WS за nginx"
+  write_links "$uuids" "$pub" "$shortid"
+  ok "Reality :443→:$reality_port (Vision) · XHTTP :443→unix-сокет · WS :443"
 }
 
+# Все три конфига наружу висят на :443 — порты 8443/10000/unix-сокет
+# для внешнего мира закрыты, их видит только nginx.
 write_links() {
   local IFS=','
   local -a uuids=()
   read -ra uuids <<< "$1"
   local IFS=$' \t\n'
-  local pub="$2" shortid="$3" dest="$4" rport="$5" xport="$6" wspath="$7"
-  local host="${dest%%:*}"
+  local pub="$2" shortid="$3"
+  local host="${REALITY_DOMAIN:-}"
+  local subdom="${DOMAIN:-}"
+  local xpath="${XHTTP_PATH:-}" wspath="${WS_PATH:-}"
   local f_links f_json
   f_links="$(path /root/gore-links.txt)"
   f_json="$(path /root/gore-clients.json)"
 
   if $DRY_RUN; then info "dry-run: ссылки клиентов в $f_links"; return 0; fi
 
+  local xp_enc wp_enc
+  xp_enc=$(printf '%s' "/$xpath" | sed 's|/|%2F|g')
+  wp_enc=$(printf '%s' "$wspath" | sed 's|/|%2F|g')
+
   : > "$f_links"
   local json="[]" n=0 u
   for u in "${uuids[@]}"; do
     n=$((n+1))
     {
-      echo "# клиент $n — Reality (XTLS-Vision)"
-      echo "vless://${u}@${IP4}:${rport}?encryption=none&security=reality&sni=${host}&fp=chrome&pbk=${pub}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#gore-reality-$n"
+      echo "# клиент $n — Reality (XTLS-Vision), :443, SNI $host"
+      echo "vless://${u}@${subdom}:443?encryption=none&flow=xtls-rprx-vision&fp=firefox&pbk=${pub}&security=reality&sid=${shortid}&sni=${host}&type=tcp#gore-reality-$n"
       echo
-      echo "# клиент $n — XHTTP + Reality (для сетей, где душат TCP-TLS)"
-      echo "vless://${u}@${IP4}:${xport}?encryption=none&security=reality&sni=${host}&fp=chrome&pbk=${pub}&sid=${shortid}&type=xhttp&path=%2Fapi%2Fv2%2Fsync&mode=auto&extra=%7B%22xPaddingBytes%22%3A%22100-1000%22%7D#gore-xhttp-$n"
+      echo "# клиент $n — XHTTP за nginx (HTTP/2), :443"
+      echo "vless://${u}@${subdom}:443?encryption=none&host=${subdom}&path=${xp_enc}&security=tls&type=xhttp#gore-xhttp-$n"
       echo
-      echo "# клиент $n — WS за nginx/Cloudflare (:443)"
-      echo "vless://${u}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&path=$(printf '%s' "$wspath" | sed 's|/|%2F|g')&host=${DOMAIN}#gore-ws-$n"
+      echo "# клиент $n — WebSocket за nginx, :443"
+      echo "vless://${u}@${subdom}:443?encryption=none&security=tls&sni=${subdom}&fp=chrome&type=ws&path=${wp_enc}&host=${subdom}#gore-ws-$n"
       echo
     } >> "$f_links"
     json=$(python3 -c "
 import json,sys
 a=json.loads('''$json''')
-a.append({'n':$n,'uuid':'$u','reality_port':$rport,'xhttp_port':$xport,'ws_path':'$wspath','sni':'$host','pbk':'$pub','sid':'$shortid'})
+a.append({'n':$n,'uuid':'$u','host':'$subdom','sni':'$host','pbk':'$pub','sid':'$shortid','ws_path':'$wspath','xhttp_path':'$xpath'})
 print(json.dumps(a))
 ")
   done
@@ -2057,14 +2084,14 @@ xui_configure() {
 
   python3 - "$XUI_DB" "$PANEL_PORT" "/$PANEL_PATH" "$SUB_PORT" "/$SUB_PATH" "/$JSON_PATH" \
       "$reality_priv" "$reality_pub" "$shortid" "${USERS:-1}" "${REALITY_PORT:-8443}" \
-      "${XHTTP_PORT:-2096}" "${WS_PORT_LOCAL:-10000}" "${WS_PATH:-}" \
-      "${DOMAIN:-}" "${REALITY_DEST:-www.microsoft.com:443}" "$flag" <<'PY'
+      "${WS_PORT_LOCAL:-10000}" "${WS_PATH:-}" \
+      "${DOMAIN:-}" "${REALITY_DOMAIN:-}" "${XHTTP_PATH:-}" "$flag" <<'PY'
 import json, secrets, sqlite3, sys, uuid, time
 
 (db, panel_port, panel_path, sub_port, sub_path, json_path,
- priv, pub, shortid, users, rport, xport, wsport, wspath, domain, dest, flag) = sys.argv[1:18]
-users = int(users); rport = int(rport); xport = int(xport); wsport = int(wsport)
-host = dest.split(':')[0]
+ priv, pub, shortid, users, rport, wsport, wspath, domain, rdom, xpath, flag) = sys.argv[1:17]
+users = int(users); rport = int(rport); wsport = int(wsport)
+host = rdom or domain
 con = sqlite3.connect(db)
 cur = con.cursor()
 
@@ -2116,28 +2143,35 @@ def client(u, suffix=''):
     }
 
 def reality_stream():
+    # dest/target — свой же фейк-сайт на :9443: сертификат всегда валиден для
+    # домена-прикрытия. acceptProxyProtocol обязателен — Reality стоит за nginx
+    # stream, который уже отправил PROXY-заголовок; без него TLS читается как
+    # мусор и рукопожатие рвётся.
     return {
         "network": "tcp", "security": "reality",
         "realitySettings": {
-            "show": False, "xver": 0, "dest": dest, "serverNames": [host],
-            "privateKey": priv, "shortIds": [shortid], "maxTimeDiff": 0,
-            # без этого блока панель не пишет pbk в ссылку → клиент падает с empty password
-            "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "",
-                         "spiderX": "/" + secrets.token_hex(4)},
+            "show": False, "xver": 0,
+            "dest": "127.0.0.1:9443", "target": "127.0.0.1:9443",
+            "serverNames": [host],
+            "privateKey": priv, "shortIds": [shortid],
+            "maxTimeDiff": 0, "minClient": "", "maxClient": "",
+            # без блока settings панель не пишет pbk в ссылку → empty password
+            "settings": {"publicKey": pub, "fingerprint": "firefox", "serverName": "",
+                         "spiderX": "/"},
         },
-        "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}},
+        "tcpSettings": {"acceptProxyProtocol": True, "header": {"type": "none"}},
     }
 
 sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"],
          "metadataOnly": False, "routeOnly": False}
 PREFIX = (flag + " ") if flag else ""   # флаг страны перед названием конфига
 
-def add_inbound(remark, port, protocol, settings, stream, tag):
+def add_inbound(remark, port, protocol, settings, stream, tag, listen=""):
     cols = [r[1] for r in cur.execute('PRAGMA table_info(inbounds)').fetchall()]
     row = {
         "user_id": 1, "up": 0, "down": 0, "total": 0,
         "remark": remark, "enable": 1, "expiry_time": 0,
-        "listen": "", "port": port, "protocol": protocol,
+        "listen": listen, "port": port, "protocol": protocol,
         "settings": json.dumps(settings, ensure_ascii=False),
         "stream_settings": json.dumps(stream, ensure_ascii=False),
         "tag": tag, "sniffing": json.dumps(sniff, ensure_ascii=False),
@@ -2157,17 +2191,24 @@ else:
                        "decryption": "none", "fallbacks": []},
                       reality_stream(), f"inbound-{rport}")
 
-    # 2. VLESS + XHTTP + Reality
-    xhttp_stream = reality_stream()
-    xhttp_stream["network"] = "xhttp"
-    xhttp_stream.pop("tcpSettings", None)
-    xhttp_stream["xhttpSettings"] = {
-        "path": "/api/v2/sync", "host": "", "headers": {},
-        "mode": "auto", "extra": {"xPaddingBytes": "100-1000"},
+    # 2. VLESS + XHTTP БЕЗ Reality: транспорт живёт только по HTTP/2, а nginx
+    #    умеет отдавать h2 бэкенду лишь через grpc_pass — поэтому Xray слушает
+    #    unix-сокет, а не TCP-порт (иначе proxy_pass по HTTP/1.1 вешает туннель)
+    xhttp_stream = {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {
+            "path": "/" + xpath, "host": domain, "headers": {},
+            "mode": "packet-up", "xPaddingBytes": "100-1000",
+        },
+        "sockopt": {"tcpMaxSeg": 1440, "tcpNoDelay": True, "tcpcongestion": "bbr"},
+        # наружу XHTTP отдаёт nginx на 443 — без externalProxy в ссылке окажется
+        # unix-сокет / порт 0, и клиент не подключится
+        "externalProxy": [{"forceTls": "tls", "dest": domain, "port": 443, "remark": ""}],
     }
-    add_inbound(f"{PREFIX}gore-xhttp", xport, "vless",
+    add_inbound(f"{PREFIX}gore-xhttp", 0, "vless",
                 {"clients": [client(u) for u in uuids], "decryption": "none", "fallbacks": []},
-                xhttp_stream, f"inbound-{xport}")
+                xhttp_stream, "inbound-xhttp", listen="/dev/shm/xray-uds.sock,0666")
 
     # 3. VLESS + WS за nginx
     ws_stream = {
@@ -2238,12 +2279,10 @@ PY2
   state_set PANEL_PASS "${PANEL_PASS:-}"
   state_set REALITY_PUB "$reality_pub"
   state_set REALITY_SHORTID "$shortid"
-  state_set REALITY_DEST "${REALITY_DEST:-www.microsoft.com:443}"
+  # ссылки строятся от доменов, а не от портов: всё живёт на :443 за nginx
   ok "панель настроена: /$PANEL_PATH → 127.0.0.1:$PANEL_PORT"
 
-  write_links "$real_uuids" "$reality_pub" "$shortid" \
-              "${REALITY_DEST:-www.microsoft.com:443}" \
-              "${REALITY_PORT:-8443}" "${XHTTP_PORT:-2096}" "${WS_PATH:-}"
+  write_links "$real_uuids" "$reality_pub" "$shortid"
 }
 
 # publicKey обязан быть парой к фактическому privateKey инбаунда.
