@@ -60,7 +60,7 @@ VLESS+Reality / XHTTP+Reality / WS и создаёт клиентов — рук
 --email <адрес>            почта ACME
 --no-cert                  самоподписанные сертификаты
 --panel yes|no             ставить 3x-ui с автонастройкой (по умолчанию yes)
---users <N>                сколько клиентов завести (по умолчанию 3)
+--users <N>                сколько клиентов завести (по умолчанию 1)
 --region ru|none           geoip/geosite и split-tunnel (по умолчанию ru)
 --fake-site corp|blog|docs|shop|auto
 --adguard-src <путь|url>   откуда взять AdGuardHome

@@ -225,7 +225,7 @@ RESTORE_FILE=""
 ADGUARD_SRC="auto"
 KEEP_DATA=false
 PANEL="yes"        # yes = ставим 3x-ui с автонастройкой, no = чистый xray без панели
-USERS="3"          # сколько клиентов завести
+USERS="1"          # сколько клиентов завести (по умолчанию один)
 REGION="ru"        # ru = geodata + split-tunnel для РФ, none = не трогать
 
 usage() {
@@ -250,7 +250,7 @@ ${C_BOLD}gore${C_RESET} — nginx SNI-роутер, фейковый сайт, S
 
   ${C_BOLD}Панель${C_RESET}
     --panel yes|no          ставить 3x-ui с автонастройкой (по умолчанию yes)
-    --users <N>             сколько клиентов завести (по умолчанию 3)
+    --users <N>             сколько клиентов завести (по умолчанию 1)
     --panel-user <логин>    логин 3x-ui (по умолчанию случайный)
     --panel-pass <пароль>   пароль 3x-ui (по умолчанию случайный)
 
@@ -2163,6 +2163,29 @@ else:
     for u in uuids:
         cur.execute('INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset) '
                     'VALUES (?, 1, ?, 0, 0, 0, 0, 0)', (iid, f"user{u[:8]}"))
+
+# 3x-ui >= 3.x: клиенты живут в таблицах clients + client_inbounds.
+# Без этих записей Xray работает, а подписка отдаёт 404 — панель ищет клиента там.
+now_ms = int(time.time() * 1000)
+try:
+    created = cur.execute("SELECT id, remark FROM inbounds WHERE remark LIKE 'gore-%'").fetchall()
+    for u in uuids:
+        email = f"user{u[:8]}"
+        cur.execute(
+            "INSERT OR REPLACE INTO clients (email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time) "
+            "VALUES (?,?,?,?,1,0,0,0)",
+            (email, SUBIDS[u], u, "xtls-rprx-vision"))
+        row = cur.execute("SELECT id FROM clients WHERE email=?", (email,)).fetchone()
+        cid = row[0]
+        for iid, remark in created:
+            flow = "xtls-rprx-vision" if remark == "gore-reality" else ""
+            cur.execute(
+                "INSERT OR REPLACE INTO client_inbounds (client_id, inbound_id, flow_override, created_at) "
+                "VALUES (?,?,?,?)", (cid, iid, flow, now_ms))
+    print(f"   таблицы clients/client_inbounds заполнены ({len(uuids)} клиент(ов))")
+except sqlite3.OperationalError:
+    # старая схема 3x-ui без этих таблиц — подписка работает по settings
+    pass
 
 con.commit()
 print(f"   inbounds: reality:{rport}, xhttp:{xport}, ws:{wsport}")
