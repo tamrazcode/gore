@@ -224,6 +224,7 @@ PANEL_PASS=""
 RESTORE_FILE=""
 ADGUARD_SRC="auto"
 KEEP_DATA=false
+COUNTRY=""         # код страны для флага в названии конфигов (NL, DE, US...)
 PANEL="yes"        # yes = ставим 3x-ui с автонастройкой, no = чистый xray без панели
 USERS="1"          # сколько клиентов завести (по умолчанию один)
 REGION="ru"        # ru = geodata + split-tunnel для РФ, none = не трогать
@@ -298,6 +299,7 @@ parse_args() {
       --panel)          PANEL="$2"; shift 2;;
       --users)          USERS="$2"; shift 2;;
       --region)         REGION="$2"; shift 2;;
+      --country)        COUNTRY="$(echo "$2" | tr '[:lower:]' '[:upper:]')"; shift 2;;
       --with-dns)       WITH_DNS=true; shift;;
       --no-dns)         WITH_DNS=false; shift;;
       --with-vpn)       WITH_VPN=true; shift;;
@@ -2040,12 +2042,17 @@ xui_configure() {
   fi
   [[ -n "$reality_priv" ]] || die "не смог сгенерировать ключи Reality"
 
-  # флаг страны для названий конфигов в клиенте
-  local cc flag=""
-  cc=$(curl -s --max-time 8 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
-  [[ "$cc" =~ ^[A-Z]{2}$ ]] || cc=$(curl -s --max-time 8 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d '[:space:]')
+  # флаг страны для названий конфигов в клиенте.
+  # ipinfo для свежих блоков врёт (наш NL-сервер он считал США/Ютой),
+  # поэтому сначала ручное указание, потом RDAP, и только потом ipinfo
+  local cc="${COUNTRY:-}" flag=""
+  if [[ -z "$cc" ]]; then
+    cc=$(curl -sL --max-time 8 "https://rdap.db.ripe.net/ip/${IP4}" 2>/dev/null \
+         | python3 -c "import json,sys; print((json.load(sys.stdin).get('country') or '').upper())" 2>/dev/null)
+  fi
+  [[ "$cc" =~ ^[A-Z]{2}$ ]] || cc=$(curl -s --max-time 8 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
   if [[ "$cc" =~ ^[A-Z]{2}$ ]]; then
-    flag=$(python3 -c "print(''.join(chr(0x1F1E6+ord(c)-65) for c in '$cc'))")
+    flag=$(python3 -c "print(''.join(chr(0x1F1E6+ord(c)-65) for c in '${cc^^}'))")
   fi
 
   python3 - "$XUI_DB" "$PANEL_PORT" "/$PANEL_PATH" "$SUB_PORT" "/$SUB_PATH" "/$JSON_PATH" \
