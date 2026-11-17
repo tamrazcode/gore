@@ -2040,14 +2040,22 @@ xui_configure() {
   fi
   [[ -n "$reality_priv" ]] || die "не смог сгенерировать ключи Reality"
 
+  # флаг страны для названий конфигов в клиенте
+  local cc flag=""
+  cc=$(curl -s --max-time 8 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
+  [[ "$cc" =~ ^[A-Z]{2}$ ]] || cc=$(curl -s --max-time 8 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d '[:space:]')
+  if [[ "$cc" =~ ^[A-Z]{2}$ ]]; then
+    flag=$(python3 -c "print(''.join(chr(0x1F1E6+ord(c)-65) for c in '$cc'))")
+  fi
+
   python3 - "$XUI_DB" "$PANEL_PORT" "/$PANEL_PATH" "$SUB_PORT" "/$SUB_PATH" "/$JSON_PATH" \
-      "$reality_priv" "$shortid" "${USERS:-3}" "${REALITY_PORT:-8443}" \
+      "$reality_priv" "$reality_pub" "$shortid" "${USERS:-1}" "${REALITY_PORT:-8443}" \
       "${XHTTP_PORT:-2096}" "${WS_PORT_LOCAL:-10000}" "${WS_PATH:-}" \
-      "${DOMAIN:-}" "${REALITY_DEST:-www.microsoft.com:443}" <<'PY'
-import json, sqlite3, sys, uuid, time
+      "${DOMAIN:-}" "${REALITY_DEST:-www.microsoft.com:443}" "$flag" <<'PY'
+import json, secrets, sqlite3, sys, uuid, time
 
 (db, panel_port, panel_path, sub_port, sub_path, json_path,
- priv, shortid, users, rport, xport, wsport, wspath, domain, dest) = sys.argv[1:16]
+ priv, pub, shortid, users, rport, xport, wsport, wspath, domain, dest, flag) = sys.argv[1:18]
 users = int(users); rport = int(rport); xport = int(xport); wsport = int(wsport)
 host = dest.split(':')[0]
 con = sqlite3.connect(db)
@@ -2082,10 +2090,10 @@ _alpha = _string.ascii_lowercase + _string.digits
 SUBIDS = {u: ''.join(secrets.choice(_alpha) for _ in range(16)) for u in uuids}
 
 # повторный запуск: inbound'ы уже созданы — переиспользуем клиентов, чтобы не менять UUID
-existing = cur.execute("SELECT COUNT(*) FROM inbounds WHERE remark LIKE 'gore-%'").fetchone()[0]
+existing = cur.execute("SELECT COUNT(*) FROM inbounds WHERE remark LIKE '%gore-%'").fetchone()[0]
 if existing:
     row = cur.execute(
-        "SELECT settings FROM inbounds WHERE remark LIKE 'gore-%' ORDER BY id LIMIT 1"
+        "SELECT settings FROM inbounds WHERE remark LIKE '%gore-%' ORDER BY id LIMIT 1"
     ).fetchone()
     try:
         uuids = [c["id"] for c in json.loads(row[0]).get("clients", [])] or uuids
@@ -2106,12 +2114,16 @@ def reality_stream():
         "realitySettings": {
             "show": False, "xver": 0, "dest": dest, "serverNames": [host],
             "privateKey": priv, "shortIds": [shortid], "maxTimeDiff": 0,
+            # без этого блока панель не пишет pbk в ссылку → клиент падает с empty password
+            "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "",
+                         "spiderX": "/" + secrets.token_hex(4)},
         },
         "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}},
     }
 
 sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"],
          "metadataOnly": False, "routeOnly": False}
+PREFIX = (flag + " ") if flag else ""   # флаг страны перед названием конфига
 
 def add_inbound(remark, port, protocol, settings, stream, tag):
     cols = [r[1] for r in cur.execute('PRAGMA table_info(inbounds)').fetchall()]
@@ -2130,10 +2142,10 @@ def add_inbound(remark, port, protocol, settings, stream, tag):
     return cur.lastrowid
 
 if existing:
-    iid = cur.execute("SELECT id FROM inbounds WHERE remark LIKE 'gore-%' ORDER BY id LIMIT 1").fetchone()[0]
+    iid = cur.execute("SELECT id FROM inbounds WHERE remark LIKE '%gore-%' ORDER BY id LIMIT 1").fetchone()[0]
 else:
     # 1. VLESS + Reality (XTLS-Vision)
-    iid = add_inbound("gore-reality", rport, "vless",
+    iid = add_inbound(f"{PREFIX}gore-reality", rport, "vless",
                       {"clients": [client(u, "xtls-rprx-vision") for u in uuids],
                        "decryption": "none", "fallbacks": []},
                       reality_stream(), f"inbound-{rport}")
@@ -2146,7 +2158,7 @@ else:
         "path": "/api/v2/sync", "host": "", "headers": {},
         "mode": "auto", "extra": {"xPaddingBytes": "100-1000"},
     }
-    add_inbound("gore-xhttp", xport, "vless",
+    add_inbound(f"{PREFIX}gore-xhttp", xport, "vless",
                 {"clients": [client(u) for u in uuids], "decryption": "none", "fallbacks": []},
                 xhttp_stream, f"inbound-{xport}")
 
@@ -2158,7 +2170,7 @@ else:
         # ссылку на локальный порт 10000, который снаружи закрыт
         "externalProxy": [{"forceTls": "tls", "dest": domain, "port": 443, "remark": ""}],
     }
-    add_inbound("gore-ws", wsport, "vless",
+    add_inbound(f"{PREFIX}gore-ws", wsport, "vless",
                 {"clients": [client(u) for u in uuids], "decryption": "none", "fallbacks": []},
                 ws_stream, f"inbound-{wsport}")
 
@@ -2171,7 +2183,7 @@ else:
 # Без этих записей Xray работает, а подписка отдаёт 404 — панель ищет клиента там.
 now_ms = int(time.time() * 1000)
 try:
-    created = cur.execute("SELECT id, remark FROM inbounds WHERE remark LIKE 'gore-%'").fetchall()
+    created = cur.execute("SELECT id, remark FROM inbounds WHERE remark LIKE '%gore-%'").fetchall()
     for u in uuids:
         email = f"user{u[:8]}"
         cur.execute(
