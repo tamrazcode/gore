@@ -18,6 +18,8 @@ umask 022
 
 VERSION="1.0.0"
 SCRIPT_NAME="gore"
+# каталог, откуда запущен скрипт (может быть /dev/fd при запуске из curl)
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /root)"
 RAW_BASE="${GORE_RAW_BASE:-https://raw.githubusercontent.com/tamrazcode/gore/main}"
 STATE_DIR="/etc/sni-stack"
 STATE_FILE="$STATE_DIR/state.env"
@@ -407,6 +409,10 @@ install_packages() {
     curl wget ca-certificates jq openssl sqlite3 dnsutils
     nginx-full python3 ufw unzip tar netcat-openbsd
   )
+  # certbot нужен только когда выпускаем настоящие сертификаты
+  if ! $NO_CERT; then
+    pkgs+=(certbot python3-certbot-nginx)
+  fi
   $WITH_DNS || pkgs+=(xxd)
   run apt-get update -qq
   run apt-get install -y -qq "${pkgs[@]}"
@@ -1411,7 +1417,7 @@ assets_fetch() {
       tar -xzf "$local_assets" -C "$ASSET_DIR"
     fi
     ok "активы из локального пути: $local_assets"
-  elif [[ -d "$ROOT_DIR/assets" ]]; then
+  elif [[ -d "${ROOT_DIR:-/nonexistent}/assets" ]]; then
     rm -rf "$ASSET_DIR"; cp -a "$ROOT_DIR/assets" "$ASSET_DIR"
     ok "активы из каталога установщика"
   else
