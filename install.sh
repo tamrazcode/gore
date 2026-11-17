@@ -2064,15 +2064,22 @@ for k, v in [
     ('webPort', panel_port), ('webBasePath', panel_path), ('webListen', '127.0.0.1'),
     ('subPort', sub_port), ('subPath', sub_path), ('subEnable', 'true'),
     ('subJsonPath', json_path),
-    ('subURI', f'https://{domain}/{sub_path.lstrip("/")}/'),
-    ('subJsonURI', f'https://{domain}/{json_path.lstrip("/")}'),
     ('subClashEnable', 'false'), ('subEnableRouting', 'false'),
+    # subURI/subJsonURI НЕ задаём: с ними суб-сервер отдаёт 301 на путь,
+    # который сам же и не обслуживает — клиент получает таймаут
+    ('subURI', ''), ('subJsonURI', ''),
     ('webDomain', ''), ('webCertFile', ''), ('webKeyFile', ''),
 ]:
     set_setting(k, v)
 
 uuids = [str(uuid.uuid4()) for _ in range(users)]
 now = int(time.time() * 1000)
+
+# subId — 16 символов alnum, одинаковый для одного клиента во всех инбаундах:
+# так все транспорты одного человека попадают в одну подписку
+import secrets, string as _string
+_alpha = _string.ascii_lowercase + _string.digits
+SUBIDS = {u: ''.join(secrets.choice(_alpha) for _ in range(16)) for u in uuids}
 
 # повторный запуск: inbound'ы уже созданы — переиспользуем клиентов, чтобы не менять UUID
 existing = cur.execute("SELECT COUNT(*) FROM inbounds WHERE remark LIKE 'gore-%'").fetchone()[0]
@@ -2090,7 +2097,7 @@ def client(u, suffix=''):
     return {
         "id": u, "flow": suffix, "email": f"user{u[:8]}",
         "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True,
-        "tgId": "", "subId": u[:16], "reset": 0,
+        "tgId": "", "subId": SUBIDS[u], "reset": 0,
     }
 
 def reality_stream():
@@ -2455,6 +2462,8 @@ EOF
       cat <<EOF
   ${C_BOLD}Панель 3x-ui${C_RESET}        https://${DOMAIN}/${PANEL_PATH}/
                           логин: ${XUI_USER:-admin}   пароль: ${XUI_PASS:-см. /etc/sni-stack/state.env}
+  ${C_DIM}URL подписки для клиентов берётся в панели: клиент → иконка подписки.
+  Прямые ссылки ниже рабочие всегда, даже если подписка в приложении капризничает.${C_RESET}
 EOF
     fi
     if [[ "${REGION:-ru}" == "ru" ]]; then
