@@ -525,6 +525,10 @@ create_layout() {
   REALITY_PORT="${REALITY_PORT:-$(state_get REALITY_PORT 2>/dev/null || echo 8443)}"
   XHTTP_PORT="${XHTTP_PORT:-$(state_get XHTTP_PORT 2>/dev/null || echo 2096)}"
   REALITY_DEST="${REALITY_DEST:-$(state_get REALITY_DEST 2>/dev/null || echo 'www.microsoft.com:443')}"
+  # пароль панели: при первом запуске генерируем, при повторном берём из state
+  PANEL_PASS="${PANEL_PASS:-$(state_get PANEL_PASS 2>/dev/null || echo)}"
+  [[ -n "$PANEL_PASS" ]] || PANEL_PASS="$(rand_str 20)"
+  state_set PANEL_PASS "$PANEL_PASS"
 
   state_set PANEL_PATH "$PANEL_PATH"
   state_set PANEL_PORT "$PANEL_PORT"
@@ -645,6 +649,9 @@ nginx_prepare() {
     grep -q 'stream-enabled' "$conf" || \
       printf '\nstream {\n    include %s/etc/nginx/stream-enabled/*.conf;\n}\n' "$P" >> "$conf"
     sed -i 's/^\( *\)server_tokens .*;/\1server_tokens off;/' "$conf"
+    if ! grep -q 'map_hash_bucket_size' "$conf"; then
+      sed -i '0,/^stream {/s//stream {\n    map_hash_bucket_size 256;\n    map_hash_max_size 16384;/' "$conf"
+    fi
     info "dry-run: nginx.conf собран в $conf"
   else
     if ! grep -q 'stream-enabled' /etc/nginx/nginx.conf; then
@@ -653,6 +660,11 @@ nginx_prepare() {
     sed -i 's/worker_connections [0-9]*;/worker_connections 8192;/' /etc/nginx/nginx.conf
     # версия nginx в заголовке не нужна (в 26.04 там server_tokens build)
     sed -i 's/^\( *\)server_tokens .*;/\1server_tokens off;/' /etc/nginx/nginx.conf
+    # в stream-map ~900 доменов: дефолтного bucket 64 байта не хватает
+    if ! grep -q 'map_hash_bucket_size' /etc/nginx/nginx.conf; then
+      sed -i '0,/^stream {/s//stream {\n    map_hash_bucket_size 256;\n    map_hash_max_size 16384;/' \
+        /etc/nginx/nginx.conf
+    fi
   fi
 
   # общие настройки http-уровня
@@ -691,7 +703,7 @@ gen_stream_conf_file() {
     $WITH_DNS && [[ -n "$DNS_DOMAIN" ]] && printf '    %-52s smartdns_monitor;\n' "$DNS_DOMAIN"
     printf '    %-52s www;\n' "$DOMAIN"
     if $WITH_VPN && [[ -n "$REALITY_DOMAIN" ]]; then
-      printf '    %-52s xray;\n' "$REALITY_DOMAIN"
+      printf '    %-52s reality_site;\n' "$REALITY_DOMAIN"
     fi
     if $WITH_DNS; then
       local policy; policy="$(path /etc/smartdns/policy.json)"
@@ -714,6 +726,7 @@ PY
     printf '%s\n' "}"
     printf '%s\n' ""
     printf '%s\n' "upstream www              { server 127.0.0.1:7443; }"
+    printf '%s\n' "upstream reality_site     { server 127.0.0.1:9443; }"
     printf '%s\n' "upstream xray             { server 127.0.0.1:8443; }"
     printf '%s\n' "upstream smartdns_relay   { server 127.0.0.1:15443; }"
     printf '%s\n' "upstream smartdns_monitor { server 127.0.0.1:17443; }"
@@ -754,8 +767,9 @@ gen_vhost_panel() {
 server {
     server_tokens off;
     server_name ${DOMAIN};
-    listen 7443 ssl http2 proxy_protocol;
+    listen 7443 ssl proxy_protocol;
     listen [::]:7443 ssl proxy_protocol;
+    http2 on;
     root $(path /var/www/html);
     index index.html;
 
@@ -802,8 +816,9 @@ gen_vhost_reality() {
 server {
     server_tokens off;
     server_name ${REALITY_DOMAIN};
-    listen 9443 ssl http2;
+    listen 9443 ssl proxy_protocol;
     listen [::]:9443 ssl proxy_protocol;
+    http2 on;
     root $(path /var/www/html);
     index index.html;
 
@@ -828,8 +843,9 @@ gen_vhost_dns() {
   write_file "/etc/nginx/conf.d/gore-dns-tls.conf" 644 <<EOF
 # gore: DoH и дашборд Smart DNS
 server {
-    listen 17443 ssl http2 proxy_protocol;
+    listen 17443 ssl proxy_protocol;
     listen [::]:17443 ssl proxy_protocol;
+    http2 on;
     server_name ${DNS_DOMAIN};
 
     ssl_certificate     ${cert}/fullchain.pem;
@@ -1629,6 +1645,8 @@ install_dashboard() {
     "$(path /etc/nginx/snippets/gore-dns.conf)" 2>/dev/null || true
 
   cp -f "$ASSET_DIR/smartdns/etc/catalog.json" "$(path /var/www/smartdns/catalog.json)"
+  # telemetry.py читает каталог из /etc/smartdns, а не из www
+  cp -f "$ASSET_DIR/smartdns/etc/catalog.json" "$(path /etc/smartdns/catalog.json)"
   ok "статика дашборда: /var/www/smartdns"
 }
 
@@ -1890,7 +1908,10 @@ PY
 }
 
 write_links() {
-  local uuids=("$1") # приходит строкой
+  local IFS=','
+  local -a uuids=()
+  read -ra uuids <<< "$1"
+  local IFS=$' \t\n'
   local pub="$2" shortid="$3" dest="$4" rport="$5" xport="$6" wspath="$7"
   local host="${dest%%:*}"
   local f_links f_json
@@ -2037,6 +2058,18 @@ for k, v in [
 uuids = [str(uuid.uuid4()) for _ in range(users)]
 now = int(time.time() * 1000)
 
+# повторный запуск: inbound'ы уже созданы — переиспользуем клиентов, чтобы не менять UUID
+existing = cur.execute("SELECT COUNT(*) FROM inbounds WHERE remark LIKE 'gore-%'").fetchone()[0]
+if existing:
+    row = cur.execute(
+        "SELECT settings FROM inbounds WHERE remark LIKE 'gore-%' ORDER BY id LIMIT 1"
+    ).fetchone()
+    try:
+        uuids = [c["id"] for c in json.loads(row[0]).get("clients", [])] or uuids
+    except Exception:
+        pass
+    print(f"   inbound'ы уже есть ({existing}), клиенты переиспользованы")
+
 def client(u, suffix=''):
     return {
         "id": u, "flow": suffix, "email": f"user{u[:8]}",
@@ -2073,37 +2106,40 @@ def add_inbound(remark, port, protocol, settings, stream, tag):
     cur.execute(f'INSERT INTO inbounds ({keys}) VALUES ({qs})', list(row.values()))
     return cur.lastrowid
 
-# 1. VLESS + Reality (XTLS-Vision)
-iid = add_inbound("gore-reality", rport, "vless",
-                  {"clients": [client(u, "xtls-rprx-vision") for u in uuids],
-                   "decryption": "none", "fallbacks": []},
-                  reality_stream(), f"inbound-{rport}")
+if existing:
+    iid = cur.execute("SELECT id FROM inbounds WHERE remark LIKE 'gore-%' ORDER BY id LIMIT 1").fetchone()[0]
+else:
+    # 1. VLESS + Reality (XTLS-Vision)
+    iid = add_inbound("gore-reality", rport, "vless",
+                      {"clients": [client(u, "xtls-rprx-vision") for u in uuids],
+                       "decryption": "none", "fallbacks": []},
+                      reality_stream(), f"inbound-{rport}")
 
-# 2. VLESS + XHTTP + Reality
-xhttp_stream = reality_stream()
-xhttp_stream["network"] = "xhttp"
-xhttp_stream.pop("tcpSettings", None)
-xhttp_stream["xhttpSettings"] = {
-    "path": "/api/v2/sync", "host": "", "headers": {},
-    "mode": "auto", "extra": {"xPaddingBytes": "100-1000"},
-}
-add_inbound("gore-xhttp", xport, "vless",
-            {"clients": [client(u) for u in uuids], "decryption": "none", "fallbacks": []},
-            xhttp_stream, f"inbound-{xport}")
+    # 2. VLESS + XHTTP + Reality
+    xhttp_stream = reality_stream()
+    xhttp_stream["network"] = "xhttp"
+    xhttp_stream.pop("tcpSettings", None)
+    xhttp_stream["xhttpSettings"] = {
+        "path": "/api/v2/sync", "host": "", "headers": {},
+        "mode": "auto", "extra": {"xPaddingBytes": "100-1000"},
+    }
+    add_inbound("gore-xhttp", xport, "vless",
+                {"clients": [client(u) for u in uuids], "decryption": "none", "fallbacks": []},
+                xhttp_stream, f"inbound-{xport}")
 
-# 3. VLESS + WS за nginx
-ws_stream = {
-    "network": "ws", "security": "none",
-    "wsSettings": {"acceptProxyProtocol": False, "path": wspath, "host": domain, "headers": {}},
-}
-add_inbound("gore-ws", wsport, "vless",
-            {"clients": [client(u) for u in uuids], "decryption": "none", "fallbacks": []},
-            ws_stream, f"inbound-{wsport}")
+    # 3. VLESS + WS за nginx
+    ws_stream = {
+        "network": "ws", "security": "none",
+        "wsSettings": {"acceptProxyProtocol": False, "path": wspath, "host": domain, "headers": {}},
+    }
+    add_inbound("gore-ws", wsport, "vless",
+                {"clients": [client(u) for u in uuids], "decryption": "none", "fallbacks": []},
+                ws_stream, f"inbound-{wsport}")
 
-# трафик-записи для клиентов (3x-ui ждёт их для статистики)
-for u in uuids:
-    cur.execute('INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset) '
-                'VALUES (?, 1, ?, 0, 0, 0, 0, 0)', (iid, f"user{u[:8]}"))
+    # трафик-записи для клиентов (3x-ui ждёт их для статистики)
+    for u in uuids:
+        cur.execute('INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset) '
+                    'VALUES (?, 1, ?, 0, 0, 0, 0, 0)', (iid, f"user{u[:8]}"))
 
 con.commit()
 print(f"   inbounds: reality:{rport}, xhttp:{xport}, ws:{wsport}")
@@ -2119,8 +2155,18 @@ print(",".join(c["id"] for c in json.loads(row[0])["clients"]))
 PY2
 )
 
+  # логин установщик 3x-ui придумывает сам — читаем его из БД, пароль задаём свой
+  if ! $DRY_RUN; then
+    XUI_USER="$(sqlite3 "$XUI_DB" "SELECT username FROM users LIMIT 1;" 2>/dev/null || true)"
+    XUI_USER="${XUI_USER:-admin}"
+    if [[ -n "${PANEL_PASS:-}" ]]; then
+      /usr/local/x-ui/x-ui setting -password "$PANEL_PASS" >/dev/null 2>&1 \
+        || warn "пароль панели сменить не вышло — поменяй вручную: x-ui setting -password ..."
+    fi
+  fi
+
   state_set PANEL_USER "${XUI_USER:-admin}"
-  state_set PANEL_PASS "${XUI_PASS:-}"
+  state_set PANEL_PASS "${PANEL_PASS:-}"
   state_set REALITY_PUB "$reality_pub"
   state_set REALITY_SHORTID "$shortid"
   state_set REALITY_DEST "${REALITY_DEST:-www.microsoft.com:443}"
@@ -2474,10 +2520,22 @@ cmd_doctor() {
 
   step "Проверки"
   chk "nginx -t"                       nginx -t
-  chk "xray config -test"              /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
+
+  # в режиме панели xray-конфиг живёт у 3x-ui, в режиме без панели — свой
+  local xcfg="" xbin=""
+  if [[ -f /usr/local/x-ui/bin/config.json ]]; then
+    xcfg=/usr/local/x-ui/bin/config.json
+    xbin="$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -1)"
+  elif [[ -f /usr/local/etc/xray/config.json ]]; then
+    xcfg=/usr/local/etc/xray/config.json
+    xbin=/usr/local/bin/xray
+  fi
+  if [[ -n "$xcfg" && -x "$xbin" ]]; then
+    chk "xray config -test ($xcfg)"     "$xbin" run -test -config "$xcfg"
+  fi
   chk "порт 443 слушается"             bash -c 'ss -tuln | grep -q ":443\b"'
   chk "порт 53 слушается"              bash -c 'ss -tuln | grep -q ":53\b"'
-  chk "DoH отвечает (POST)"            bash -c 'printf "\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07github\x03com\x00\x00\x01\x00\x01" > /tmp/gore-q.bin; curl -sk -o /dev/null -w "%{http_code}" -X POST https://127.0.0.1:10443/dns-query -H "content-type: application/dns-message" --data-binary @/tmp/gore-q.bin | grep -q 200'
+  chk "DoH отвечает (POST)"            bash -c 'd="$1"; printf "\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07github\x03com\x00\x00\x01\x00\x01" > /tmp/gore-q.bin; curl -sk -o /dev/null -w "%{http_code}" -X POST "https://$d/dns-query" -H "content-type: application/dns-message" --data-binary @/tmp/gore-q.bin | grep -q 200' _ "${DNS_DOMAIN:-$(state_get DNS_DOMAIN 2>/dev/null || echo)}"
   chk "flood nginx: журнал < 500M"     bash -c 'a=$(journalctl --disk-usage 2>/dev/null | grep -oE "[0-9.]+[GM]" | head -1); echo $a'
 
   step "DNS-ответы"
