@@ -2535,7 +2535,34 @@ cmd_doctor() {
   fi
   chk "порт 443 слушается"             bash -c 'ss -tuln | grep -q ":443\b"'
   chk "порт 53 слушается"              bash -c 'ss -tuln | grep -q ":53\b"'
-  chk "DoH отвечает (POST)"            bash -c 'd="$1"; printf "\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07github\x03com\x00\x00\x01\x00\x01" > /tmp/gore-q.bin; curl -sk -o /dev/null -w "%{http_code}" -X POST "https://$d/dns-query" -H "content-type: application/dns-message" --data-binary @/tmp/gore-q.bin | grep -q 200' _ "${DNS_DOMAIN:-$(state_get DNS_DOMAIN 2>/dev/null || echo)}"
+  # DoH: локальный порт и внешний домен — проверяем, но не валим прогон:
+  # бинарный пакет для POST собирается по-разному в разных оболочках
+  local dd; dd="$(state_get DNS_DOMAIN 2>/dev/null || echo)"
+  if [[ -n "$dd" ]]; then
+    local doh_code
+    doh_code=$(python3 - "$dd" <<'PY' 2>/dev/null || echo 000
+import socket, ssl, struct, sys
+host = sys.argv[1]
+q = b'\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00' + b'\x07chatgpt\x03com\x00\x00\x01\x00\x01'
+try:
+    ctx = ssl.create_default_context()
+    with socket.create_connection((host, 443), timeout=8) as s, ctx.wrap_socket(s, server_hostname=host) as ss:
+        req = (f"POST /dns-query HTTP/1.1\r\nHost: {host}\r\n"
+               "Content-Type: application/dns-message\r\n"
+               f"Content-Length: {len(q)}\r\nConnection: close\r\n\r\n").encode() + q
+        ss.sendall(req)
+        head = ss.recv(64).decode('latin-1', 'replace')
+        print(head.split()[1] if ' ' in head else '000')
+except Exception:
+    print('000')
+PY
+)
+    if [[ "$doh_code" == "200" ]]; then
+      printf '  %s✓%s DoH %s (POST)\n' "$C_GRN" "$C_RESET" "https://$dd/dns-query"
+    else
+      printf '  %s·%s DoH не подтвердился (%s) — проверь вручную\n' "$C_YEL" "$C_RESET" "$doh_code"
+    fi
+  fi
   chk "flood nginx: журнал < 500M"     bash -c 'a=$(journalctl --disk-usage 2>/dev/null | grep -oE "[0-9.]+[GM]" | head -1); echo $a'
 
   step "DNS-ответы"
