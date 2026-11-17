@@ -2154,6 +2154,9 @@ else:
     ws_stream = {
         "network": "ws", "security": "none",
         "wsSettings": {"acceptProxyProtocol": False, "path": wspath, "host": domain, "headers": {}},
+        # наружу WS отдаёт nginx на 443: без externalProxy панель сгенерит
+        # ссылку на локальный порт 10000, который снаружи закрыт
+        "externalProxy": [{"forceTls": "tls", "dest": domain, "port": 443, "remark": ""}],
     }
     add_inbound("gore-ws", wsport, "vless",
                 {"clients": [client(u) for u in uuids], "decryption": "none", "fallbacks": []},
